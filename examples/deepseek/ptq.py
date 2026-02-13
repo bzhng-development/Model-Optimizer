@@ -64,21 +64,132 @@ from modelopt.torch.quantization.utils import (
 from modelopt.torch.utils.dataset_utils import get_dataset_dataloader
 from modelopt.torch.utils.distributed import ParallelState
 
-DS_V3_PATH = Path(__file__).resolve().parent / "DeepSeek-V3/inference"
-DS_V3_2_PATH = Path(__file__).resolve().parent / "DeepSeek-V3.2-Exp/inference"
+deekseep_model = None
+weight_dequant = None
+act_quant = None
+fp8_gemm = None
 
-if DS_V3_2_PATH.exists():
-    sys.path.append(str(DS_V3_2_PATH))
-elif DS_V3_PATH.exists():
-    sys.path.append(str(DS_V3_PATH))
-else:
-    raise ValueError(
-        f"DeepSeek-V3 or DeepSeek-V3.2-Exp not found in {Path(__file__).resolve().parent}"
-    )
+# HF config field name → DeepSeek ModelArgs field name
+_HF_TO_MODELARGS = {
+    "hidden_size": "dim",
+    "intermediate_size": "inter_dim",
+    "moe_intermediate_size": "moe_inter_dim",
+    "num_hidden_layers": "n_layers",
+    "first_k_dense_replace": "n_dense_layers",
+    "num_attention_heads": "n_heads",
+    "num_experts_per_tok": "n_activated_experts",
+    "n_group": "n_expert_groups",
+    "topk_group": "n_limited_groups",
+    "routed_scaling_factor": "route_scale",
+    "scoring_func": "score_func",
+    "max_position_embeddings": "max_seq_len",
+}
 
-import model as deekseep_model  # noqa: E402
-from ds_kernel import weight_dequant  # noqa: E402
-from kernel import act_quant, fp8_gemm  # noqa: E402
+# Weight name mapping from HF → DeepSeek (target_name, shard_dim)
+_HF_WEIGHT_MAPPING = {
+    "embed_tokens": ("embed", 0),
+    "input_layernorm": ("attn_norm", None),
+    "post_attention_layernorm": ("ffn_norm", None),
+    "q_proj": ("wq", 0),
+    "q_a_proj": ("wq_a", None),
+    "q_a_layernorm": ("q_norm", None),
+    "q_b_proj": ("wq_b", 0),
+    "kv_a_proj_with_mqa": ("wkv_a", None),
+    "kv_a_layernorm": ("kv_norm", None),
+    "kv_b_proj": ("wkv_b", 0),
+    "o_proj": ("wo", 1),
+    "gate": ("gate", None),
+    "gate_proj": ("w1", 0),
+    "down_proj": ("w2", 1),
+    "up_proj": ("w3", 0),
+    "norm": ("norm", None),
+    "lm_head": ("head", 0),
+    "scale": ("scale", None),
+    "wq_b": ("wq_b", None),
+    "wk": ("wk", None),
+    "k_norm": ("k_norm", None),
+    "weights_proj": ("weights_proj", None),
+}
+
+
+def setup_inference_modules(inference_path=None):
+    """Set up the DeepSeek inference modules by adding the inference code to sys.path.
+
+    Args:
+        inference_path: Explicit path to the inference code directory. If None,
+            auto-detects from DeepSeek-V3.2-Exp/inference or DeepSeek-V3/inference
+            relative to this script.
+    """
+    global deekseep_model, weight_dequant, act_quant, fp8_gemm
+
+    if inference_path is not None:
+        path = Path(inference_path)
+        if not path.exists():
+            raise ValueError(f"Inference path does not exist: {path}")
+        sys.path.append(str(path))
+    else:
+        ds_v3_path = Path(__file__).resolve().parent / "DeepSeek-V3/inference"
+        ds_v3_2_path = Path(__file__).resolve().parent / "DeepSeek-V3.2-Exp/inference"
+        if ds_v3_2_path.exists():
+            sys.path.append(str(ds_v3_2_path))
+        elif ds_v3_path.exists():
+            sys.path.append(str(ds_v3_path))
+        else:
+            raise ValueError(
+                f"DeepSeek-V3 or DeepSeek-V3.2-Exp not found in {Path(__file__).resolve().parent}."
+                " Use --inference_path to specify the inference code directory."
+            )
+
+    import model as _deekseep_model
+    from ds_kernel import weight_dequant as _weight_dequant
+    from kernel import act_quant as _act_quant
+    from kernel import fp8_gemm as _fp8_gemm
+
+    deekseep_model = _deekseep_model
+    weight_dequant = _weight_dequant
+    act_quant = _act_quant
+    fp8_gemm = _fp8_gemm
+
+
+def map_hf_config(config_dict):
+    """Translate HF config fields to DeepSeek ModelArgs fields.
+
+    If the config already uses DeepSeek naming (no ``hidden_size`` key), it is
+    returned as-is.  Otherwise, known HF field names are mapped and
+    ``rope_theta`` is extracted from nested rope config structures.
+    """
+    if "hidden_size" not in config_dict:
+        return config_dict
+
+    mapped = {}
+    for key, value in config_dict.items():
+        if key in _HF_TO_MODELARGS:
+            mapped[_HF_TO_MODELARGS[key]] = value
+        elif key in (
+            "vocab_size",
+            "n_routed_experts",
+            "n_shared_experts",
+            "q_lora_rank",
+            "kv_lora_rank",
+            "qk_nope_head_dim",
+            "qk_rope_head_dim",
+            "v_head_dim",
+        ):
+            # Fields that share the same name in both formats
+            mapped[key] = value
+        elif key.startswith("index_"):
+            # index_n_heads, index_head_dim, index_topk, etc.
+            mapped[key] = value
+
+    # Extract rope_theta from nested structures
+    if "rope_theta" in config_dict:
+        mapped["rope_theta"] = config_dict["rope_theta"]
+    elif "rope_scaling" in config_dict and isinstance(config_dict["rope_scaling"], dict):
+        rope_cfg = config_dict["rope_scaling"]
+        if "rope_theta" in rope_cfg:
+            mapped["rope_theta"] = rope_cfg["rope_theta"]
+
+    return mapped
 
 
 def monkey_patch_deepseek_model():
@@ -231,6 +342,90 @@ def monkey_patch_deepseek_model():
     mtq.register(original_cls=deekseep_model.MoE, quantized_cls=CalibMoe)
 
 
+def _convert_hf_name(name):
+    """Convert a single HF weight name to DeepSeek format.
+
+    Returns (converted_name, shard_dim) or None if the name should be skipped.
+    """
+    if name.startswith("model."):
+        name = name[len("model."):]
+    name = name.replace("self_attn", "attn")
+    name = name.replace("mlp", "ffn")
+    name = name.replace("weight_scale_inv", "scale")
+    name = name.replace("e_score_correction_bias", "bias")
+    key = name.split(".")[-2]
+    if key not in _HF_WEIGHT_MAPPING:
+        return None
+    new_key, dim = _HF_WEIGHT_MAPPING[key]
+    name = name.replace(key, new_key)
+    return name, dim
+
+
+def _load_hf_sharded_checkpoint(model, model_path, world_size, rank):
+    """Load an HF sharded safetensors checkpoint, converting names and sharding in-memory."""
+    from safetensors.torch import safe_open
+
+    index_path = os.path.join(model_path, "model.safetensors.index.json")
+    with open(index_path) as f:
+        index = json.load(f)
+
+    n_layers = len(model.layers)
+    n_routed_experts = model.args.n_routed_experts
+    n_local_experts = n_routed_experts // world_size
+
+    # Collect unique shard files
+    shard_files = sorted(set(index["weight_map"].values()))
+
+    state_dict = {}
+    for shard_file in tqdm(shard_files, desc="Loading HF shards"):
+        shard_path = os.path.join(model_path, shard_file)
+        with safe_open(shard_path, framework="pt", device="cpu") as f:
+            for hf_name in f.keys():
+                # Skip MTP layers (layers beyond the main model layers)
+                layer_match = _extract_layer_idx(hf_name)
+                if layer_match is not None and layer_match >= n_layers:
+                    continue
+
+                result = _convert_hf_name(hf_name)
+                if result is None:
+                    continue
+                name, dim = result
+                param = f.get_tensor(hf_name)
+
+                # Shard for model parallelism
+                if "experts" in name and "shared_experts" not in name:
+                    idx = int(name.split(".")[-3])
+                    if idx < rank * n_local_experts or idx >= (rank + 1) * n_local_experts:
+                        continue
+                elif dim is not None and world_size > 1:
+                    assert param.size(dim) % world_size == 0
+                    shard_size = param.size(dim) // world_size
+                    param = param.narrow(dim, rank * shard_size, shard_size).contiguous()
+
+                state_dict[name] = param
+
+    missing, unexpected = model.load_state_dict(state_dict, strict=False)
+    if unexpected:
+        print(f"Warning: unexpected keys in checkpoint: {unexpected}")
+    if missing:
+        # Filter out known-optional missing keys (e.g. gate bias for non-7168 dim)
+        important_missing = [k for k in missing if "freq" not in k]
+        if important_missing:
+            print(f"Warning: missing keys in checkpoint: {important_missing}")
+
+
+def _extract_layer_idx(name):
+    """Extract the layer index from a parameter name like 'model.layers.42.attn...'."""
+    parts = name.split(".")
+    for i, part in enumerate(parts):
+        if part == "layers" and i + 1 < len(parts):
+            try:
+                return int(parts[i + 1])
+            except ValueError:
+                pass
+    return None
+
+
 def load_deepseek_model(model_config: str, model_path: str, batch_size: int):
     """Loads the deepseek model to memory."""
     # get distributed info
@@ -246,30 +441,48 @@ def load_deepseek_model(model_config: str, model_path: str, batch_size: int):
 
     # get config and build model
     with open(model_config) as f:
-        model_args = deekseep_model.ModelArgs(**json.load(f))
-        model_args.max_batch_size = max(batch_size, model_args.max_batch_size)
+        config_dict = json.load(f)
+    config_dict = map_hf_config(config_dict)
+    model_args = deekseep_model.ModelArgs(**config_dict)
+    model_args.max_batch_size = max(batch_size, model_args.max_batch_size)
     with torch.device("cuda"):
         model = deekseep_model.Transformer(model_args)
 
     # monkey path the model definition for quantization
     monkey_patch_deepseek_model()
 
-    # load model
-    checkpoint_path = os.path.join(model_path, f"model{rank}-mp{world_size}.safetensors")
-    print(f"Loading {checkpoint_path}")
+    # Detect checkpoint format
+    hf_index = os.path.join(model_path, "model.safetensors.index.json")
+    per_rank_ckpt = os.path.join(model_path, f"model{rank}-mp{world_size}.safetensors")
 
-    # Temporary fix for fp32 params
-    fp32_params = {}
-    for name, param in model.named_parameters():
-        if param.dtype == torch.float32 and (
-            "head.weight" in name or "attn.indexer.weights_proj.weight" in name
-        ):
-            param.data = param.data.to(torch.get_default_dtype())
-            fp32_params[name] = param
-    load_model(model, checkpoint_path)
-    for param in fp32_params.values():
-        param.data = param.data.to(torch.float32)
-    print(f"Loaded {checkpoint_path}")
+    if os.path.exists(per_rank_ckpt):
+        # DeepSeek per-rank format
+        print(f"Loading {per_rank_ckpt}")
+
+        # Temporary fix for fp32 params
+        fp32_params = {}
+        for name, param in model.named_parameters():
+            if param.dtype == torch.float32 and (
+                "head.weight" in name or "attn.indexer.weights_proj.weight" in name
+            ):
+                param.data = param.data.to(torch.get_default_dtype())
+                fp32_params[name] = param
+        load_model(model, per_rank_ckpt)
+        for param in fp32_params.values():
+            param.data = param.data.to(torch.float32)
+        print(f"Loaded {per_rank_ckpt}")
+    elif os.path.exists(hf_index):
+        # HF sharded safetensors format
+        print(f"Loading HF sharded checkpoint from {model_path}")
+        _load_hf_sharded_checkpoint(model, model_path, world_size, rank)
+        print(f"Loaded HF sharded checkpoint from {model_path}")
+    else:
+        raise FileNotFoundError(
+            f"No checkpoint found in {model_path}. Expected either "
+            f"'{os.path.basename(per_rank_ckpt)}' (DeepSeek format) or "
+            f"'model.safetensors.index.json' (HF format)."
+        )
+
     return model
 
 
@@ -433,8 +646,16 @@ if __name__ == "__main__":
         default=None,
         help="MLA quantization type: None (disable), per_tensor_fp8, nvfp4",
     )
+    parser.add_argument(
+        "--inference_path",
+        type=str,
+        default=None,
+        help="Path to the DeepSeek inference code directory (containing model.py, kernel.py). "
+        "If not provided, auto-detects from DeepSeek-V3.2-Exp/inference or DeepSeek-V3/inference.",
+    )
 
     args = parser.parse_args()
+    setup_inference_modules(args.inference_path)
     model = load_deepseek_model(args.config, args.model_path, args.batch_size)
     tokenizer = AutoTokenizer.from_pretrained(
         args.model_path, trust_remote_code=args.trust_remote_code
